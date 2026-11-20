@@ -1,0 +1,20 @@
+# The original task statement (PDF) is not redistributed; it is quoted in README.md instead.
+*.pdf
+
+# Run outputs (large; produced by run_all.sh)
+data/sd35m_*/
+runs/
+eval/
+logs/
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,16 @@
+# Exact versions the code is tested with (tests/test_smoke.py). Python >= 3.12 (numpy 2.5).
+# torch is NOT listed here: setup_env.sh installs the CUDA build that matches the host driver:
+#   torch==2.15.0  from https://download.pytorch.org/whl/cu132   (driver with CUDA >= 13.2)
+#   torch==2.14.1  from https://download.pytorch.org/whl/cu126   (any CUDA 12.x driver)
+diffusers==0.43.0
+transformers==5.23.0
+peft==0.22.0
+accelerate==1.16.0
+datasets==5.2.0
+huggingface_hub==2.4.0
+safetensors==0.8.0
+sentencepiece==0.2.3
+protobuf==7.36.2
+pyarrow==26.0.1
+numpy==2.5.5
+pillow==13.0.0
