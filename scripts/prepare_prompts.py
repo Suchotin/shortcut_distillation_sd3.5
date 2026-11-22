@@ -105,14 +105,21 @@ def main():
     ap.add_argument("--frac_text", type=float, default=0.10)
     ap.add_argument("--max_words", type=int, default=60)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--exclude", nargs="*", default=[],
+                    help="prompt files (one per line) whose prompts must not be reused, "
+                         "e.g. the corpus of an earlier run when adding fresh data")
     args = ap.parse_args()
     rng = random.Random(args.seed)
 
     parti = {norm(p) for p in load_dataset("nateraw/parti-prompts", split="train")["Prompt"]}
+    banned = set(parti)  # == parti without --exclude, so earlier corpora stay reproducible
+    for path in args.exclude:
+        with open(path) as f:
+            banned |= {norm(line) for line in f if line.strip()}
 
     def take(pool, n):
         pool = [clean(p) for p in pool]
-        pool = [p for p in pool if ok(p, args.max_words, args.filter) and norm(p) not in parti]
+        pool = [p for p in pool if ok(p, args.max_words, args.filter) and norm(p) not in banned]
         rng.shuffle(pool)
         return pool[:n]
 
@@ -144,7 +151,7 @@ def main():
 
     seen, uniq = set(), []
     for p, s in zip(prompts, sources):  # dedupe (templates may repeat) while keeping order
-        if norm(p) not in seen and norm(p) not in parti:
+        if norm(p) not in seen and norm(p) not in banned:
             seen.add(norm(p))
             uniq.append((p, s))
     rng.shuffle(uniq)
