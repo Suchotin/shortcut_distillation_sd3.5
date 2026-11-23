@@ -66,6 +66,9 @@ class ShortcutConfig:
     lora_rank: int = 64
     lora_alpha: int = 64
     lora_targets: list = field(default_factory=lambda: list(DEFAULT_LORA_TARGETS))
+    # target of the d = 0 (flow-matching) head: "data" = noise - x_data (paper), "teacher" = the
+    # frozen teacher's CFG velocity, i.e. guidance is distilled into d = 0 as well
+    fm_target: str = "data"
 
     @property
     def num_levels(self) -> int:  # number of bootstrap levels: student d in {2/M, ..., 1}
@@ -187,17 +190,29 @@ def sample_flow_matching(n, cfg: ShortcutConfig, generator=None, device=None):
     return sigma, torch.zeros(n, device=device)
 
 
-def sample_bootstrap(n, cfg: ShortcutConfig, levels=None, generator=None, device=None):
+def sample_bootstrap(n, cfg: ShortcutConfig, levels=None, generator=None, device=None,
+                     anchor_fraction=None):
     """Self-consistency samples (paper Alg. 1 + "discrete time sampling").
 
     Level j in 1..K trains the student step d = 2^j / M from two half-steps of 2^(j-1) / M.
     Start times are multiples of the student step: u in {1, 1 - d, ..., d}.
-    Levels are assigned round-robin (as in the official code) so every batch covers them evenly.
+    By default levels are assigned round-robin (as in the official code) so every batch covers
+    them evenly. With `anchor_fraction` each sample is drawn independently: level 1, the only
+    level whose target comes from the d = 0 base case (the teacher), with that probability, the
+    other levels uniformly.
     Returns per-sample sigma at start / middle / end, student d, half-step d, and the level.
     """
     levels = list(levels) if levels is not None else list(range(1, cfg.num_levels + 1))
-    offset = int(torch.randint(0, len(levels), (1,), generator=generator))
-    j = torch.tensor([levels[(i + offset) % len(levels)] for i in range(n)])
+    if anchor_fraction is None:
+        offset = int(torch.randint(0, len(levels), (1,), generator=generator))
+        j = torch.tensor([levels[(i + offset) % len(levels)] for i in range(n)])
+    else:
+        assert 1 in levels and 0.0 < anchor_fraction <= 1.0, (levels, anchor_fraction)
+        rest = [lv for lv in levels if lv != 1]
+        w = torch.tensor([anchor_fraction] + [(1.0 - anchor_fraction) / max(len(rest), 1)] * len(rest),
+                         dtype=torch.float64)
+        idx = torch.multinomial(w, n, replacement=True, generator=generator)
+        j = torch.tensor([1] + rest)[idx]
     d_student = (2.0 ** j.double()) / cfg.base_steps
     n_slots = (cfg.base_steps // (2 ** j)).long()
     k = (torch.rand(n, generator=generator, dtype=torch.float64) * n_slots).floor()
@@ -258,7 +273,8 @@ def shortcut_sample(model, noise, pe, pp, num_steps, cfg: ShortcutConfig, null_p
     """Paper Alg. 2 on the shifted grid.
 
     num_steps < M: shortcut mode, d = 1/num_steps, one forward pass per step, no CFG.
-    num_steps >= M: the d = 0 flow model with CFG (behaves like the original SD3.5).
+    num_steps >= M: the d = 0 flow model with CFG (behaves like the original SD3.5); if the d = 0
+    head was trained on the teacher's guided velocity (fm_target = "teacher"), without CFG.
     """
     b = noise.shape[0]
     sigmas = sampling_sigmas(num_steps, cfg.shift, device=noise.device)
@@ -266,7 +282,12 @@ def shortcut_sample(model, noise, pe, pp, num_steps, cfg: ShortcutConfig, null_p
     if shortcut and cfg.base_steps % num_steps != 0:
         print(f"[warn] {num_steps} steps is not a trained shortcut level (powers of two < M)")
     d = torch.full((b,), 1.0 / num_steps if shortcut else 0.0, device=noise.device)
-    w = None if shortcut else (flow_cfg_scale or cfg.cfg_scale)
+    if shortcut:
+        w = None
+    elif flow_cfg_scale is not None:
+        w = flow_cfg_scale
+    else:
+        w = None if cfg.fm_target == "teacher" else cfg.cfg_scale
     x = noise.float()
     for i in range(num_steps):
         sigma = sigmas[i].expand(b)

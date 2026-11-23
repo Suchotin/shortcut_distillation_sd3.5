@@ -3,12 +3,17 @@
 Each batch (paper Eq. 5 / Alg. 1):
   * (1 - k) of the samples: flow matching at d = 0 on teacher-generated data
         loss = || s(x_sigma, sigma, 0) - (noise - x_data) ||^2       (+ prompt dropout for CFG)
+    or, with --fm_target teacher, against the frozen teacher's CFG velocity at the same point
+        loss = || s(x_sigma, sigma, 0) - v_teacher_cfg(x_sigma, sigma) ||^2
+    (deterministic: no noise floor, and the guidance is distilled into d = 0 as well)
   * k of the samples: self-consistency at a random level j (student step d = 2^j / M)
         loss = || s(x_sigma, sigma, d) - stopgrad(EMA two half-steps of d/2) ||^2
     Level 1's half-steps are the d = 0 base case evaluated with CFG, which distills guidance
     into every d > 0, so shortcut sampling needs one forward pass per step. By default that
     base case is the frozen teacher (--base_velocity teacher); --base_velocity ema uses the
     student's own EMA d = 0 prediction exactly as in the from-scratch paper.
+    Levels are round-robin by default; --anchor_fraction gives level 1, the only level anchored
+    to the teacher, a fixed share of the self-consistency samples.
 
 Usage (single GPU):
   accelerate launch scripts/train.py --data_dir data/sd35m_512 --output_dir runs/shortcut
@@ -35,8 +40,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from shortcut_sd35.data import (LatentDataset, load_meta, load_null_embeds,  # noqa: E402
                                 load_showcase)
 from shortcut_sd35.shortcut import (EMA, ShortcutConfig, ShortcutSD3, add_lora,  # noqa: E402
-                                    sample_bootstrap, sample_flow_matching, save_student,
-                                    self_consistency_target, shortcut_sample)
+                                    predict, sample_bootstrap, sample_flow_matching,
+                                    save_student, self_consistency_target, shortcut_sample)
 
 
 def parse_args(argv=None):
@@ -54,6 +59,13 @@ def parse_args(argv=None):
                     help="d=0 half-steps of level 1 (base case of the recursion): frozen teacher "
                          "(distillation; avoids drift of the student's own d=0 head and double "
                          "CFG on CFG-generated data) or the student's own EMA (paper, from scratch)")
+    ap.add_argument("--fm_target", choices=["data", "teacher"], default="data",
+                    help="target of the flow-matching (d=0) branch: noise - x_data on the teacher's "
+                         "images (paper) or the frozen teacher's CFG velocity at the same point "
+                         "(deterministic, no noise floor; guidance distilled into d=0 too)")
+    ap.add_argument("--anchor_fraction", type=float, default=None,
+                    help="share of the self-consistency samples at level 1, the only level whose "
+                         "target comes from the teacher (default: levels round-robin)")
     ap.add_argument("--prompt_dropout", type=float, default=0.1)
     ap.add_argument("--target_clip", type=float, default=None, help="official code uses 4")
     ap.add_argument("--ema_decay", type=float, default=0.999)
@@ -122,7 +134,8 @@ def main(argv=None):
     meta = load_meta(args.data_dir)
     cfg = ShortcutConfig(base_steps=args.base_steps, shift=meta["shift"],
                          cfg_scale=args.cfg_scale if args.cfg_scale is not None else meta["cfg"],
-                         lora_rank=args.lora_rank, lora_alpha=args.lora_alpha)
+                         lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,
+                         fm_target=args.fm_target)
     levels = [j for j in range(1, cfg.num_levels + 1)
               if 2 ** j <= cfg.base_steps // args.min_shortcut_steps]
 
@@ -231,11 +244,20 @@ def main(argv=None):
                     pe[i], pp[i] = null_pe.expand(len(i), -1, -1), null_pp.expand(len(i), -1)
                 sv = s_fm.view(-1, 1, 1, 1)
                 x_fm = (1 - sv) * x_data[nb:] + sv * noise[nb:]
-                tgt_fm = noise[nb:] - x_data[nb:]
+                if args.fm_target == "teacher":
+                    # the frozen teacher's guided velocity at the same point (dropped prompts ->
+                    # cond = uncond, i.e. the unconditional velocity)
+                    with torch.no_grad(), accelerator.autocast():
+                        tgt_fm = predict(net, x_fm, s_fm, d_fm, pe[nb:], pp[nb:],
+                                         cfg_scale=cfg.cfg_scale, null_pe=null_pe,
+                                         null_pp=null_pp, teacher=True)
+                else:
+                    tgt_fm = noise[nb:] - x_data[nb:]
 
                 # self-consistency part (d > 0), EMA two-half-step targets
                 if nb > 0:
-                    b = sample_bootstrap(nb, cfg, levels, gen, device)
+                    b = sample_bootstrap(nb, cfg, levels, gen, device,
+                                         anchor_fraction=args.anchor_fraction)
                     s0 = b["sigma0"].view(-1, 1, 1, 1)
                     x_b = (1 - s0) * x_data[:nb] + s0 * noise[:nb]
                     with ema.swapped(), accelerator.autocast():
@@ -299,7 +321,16 @@ def main(argv=None):
         if step >= args.max_steps:
             break
 
-    save("final")
+    last = f"checkpoint-{step}"
+    final = os.path.join(args.output_dir, "final")
+    if accelerator.is_main_process and os.path.islink(final):
+        os.remove(final)  # link left by an earlier run in this directory (the link only)
+    if (accelerator.is_main_process and not os.path.exists(final)
+            and os.path.exists(os.path.join(args.output_dir, last, "train_state.pt"))):
+        os.symlink(last, final)  # the last checkpoint is the final state: no second 2.5 GB copy
+        accelerator.print(f"final -> {last}")
+    else:
+        save("final")
     run_validation()
     accelerator.end_training()
 

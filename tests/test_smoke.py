@@ -104,7 +104,58 @@ def test_grid_and_sampling():
     # restricting levels (e.g. only >= 4 steps)
     b4 = sample_bootstrap(50, cfg, levels=[1, 2, 3], generator=g)
     assert b4["d_student"].max() <= 0.25 + 1e-6
+    # fixed share for the teacher-anchored level 1, the other levels uniform
+    ba = sample_bootstrap(8000, cfg, generator=g, anchor_fraction=0.4)
+    share = {lv: float((ba["level"] == lv).float().mean()) for lv in range(1, 6)}
+    assert abs(share[1] - 0.4) < 0.03 and all(abs(share[lv] - 0.15) < 0.03 for lv in range(2, 6))
+    assert torch.all(ba["d_half"][ba["level"] == 1] == 0)
     print("ok grid / bootstrap sampling")
+
+
+class RecordBatch(torch.nn.Module):
+    """Fake model that records the batch size of every call (CFG doubles it)."""
+
+    def __init__(self):
+        super().__init__()
+        self.sizes = []
+
+    def forward(self, x, sigma, d, pe, pp, use_d=True):
+        self.sizes.append(x.shape[0])
+        return torch.zeros_like(x)
+
+
+def test_flow_mode_cfg():
+    x = torch.randn(2, C, H, H)
+    pe, pp = rand_cond(2)
+    npe, npp = rand_cond(1)
+    for fm_target, expected in (("data", 4), ("teacher", 2)):
+        m = RecordBatch()
+        cfg = ShortcutConfig(base_steps=8, fm_target=fm_target)
+        shortcut_sample(m, x, pe, pp, 8, cfg, null_pe=npe, null_pp=npp)  # 8 >= M: flow mode
+        assert set(m.sizes) == {expected}, (fm_target, m.sizes)
+        m = RecordBatch()
+        shortcut_sample(m, x, pe, pp, 4, cfg, null_pe=npe, null_pp=npp)  # shortcut: never CFG
+        assert set(m.sizes) == {2}
+    print("ok flow mode: CFG only if the d = 0 head is not guidance-distilled")
+
+
+def test_guidance_diagnostic_identity():
+    import diagnose_guidance
+
+    tr = tiny_transformer()
+    cfg = ShortcutConfig(base_steps=8, lora_rank=4, lora_alpha=4, cfg_scale=4.5)
+    add_lora(tr, cfg)  # lora_B = 0 and zero-init d-embedder: the student is the teacher
+    m = ShortcutSD3(tr).eval()
+    x = torch.randn(6, C, H, H)
+    pe, pp = rand_cond(6)
+    npe, npp = rand_cond(1)
+    r = diagnose_guidance.guidance_stats(m, cfg, x, pe, pp, npe, npp, torch.Generator().manual_seed(0),
+                                         batch_size=4)
+    assert abs(r["w_eff"]["d=0"]["all"] - 1) < 1e-4 and abs(r["w_eff"]["d=0.25"]["all"] - 1) < 1e-4
+    assert abs(r["level1_loss_student"] - r["level1_loss_cond_teacher"]) < 1e-6
+    assert math.isfinite(r["w_eff"]["level-1 target"]["all"])
+    print(diagnose_guidance.to_markdown(r, "identity student").splitlines()[-1])
+    print("ok guidance diagnostic (student = teacher -> w_eff = 1)")
 
 
 class ConstVel(torch.nn.Module):
@@ -212,6 +263,9 @@ def test_train_end_to_end(mixed_precision):
                   "--gradient_checkpointing", "--lr", "1e-3", "--warmup_steps", "0"]
         train.main(common + ["--max_steps", "6", "--base_velocity", "teacher"])
         assert os.path.exists(os.path.join(out, "final", "student_ema", "lora.safetensors"))
+        # the last checkpoint is the final state: linked, not copied
+        assert os.path.islink(os.path.join(out, "final"))
+        assert os.readlink(os.path.join(out, "final")) == "checkpoint-6"
         # old optimizer states are pruned, student weights are kept
         assert not os.path.exists(os.path.join(out, "checkpoint-3", "train_state.pt"))
         assert os.path.exists(os.path.join(out, "checkpoint-3", "student_ema", "lora.safetensors"))
@@ -219,10 +273,31 @@ def test_train_end_to_end(mixed_precision):
         assert os.path.exists(os.path.join(out, "samples", "step_000006.png"))
         logs = [json.loads(line) for line in open(os.path.join(out, "log.jsonl"))]
         assert all(math.isfinite(v) for r in logs for v in r.values() if isinstance(v, float))
-        # resume and continue
+        # resume and continue (step 8 is not a checkpoint step: final becomes a real directory)
         train.main(common + ["--max_steps", "8", "--resume", os.path.join(out, "checkpoint-6")])
+        assert not os.path.islink(os.path.join(out, "final"))
         st = torch.load(os.path.join(out, "final", "train_state.pt"))
         assert st["step"] == 8
+        assert os.path.exists(os.path.join(out, "checkpoint-6", "student_ema", "lora.safetensors"))
+
+        # teacher-target flow matching + anchored level 1
+        out2 = os.path.join(tmp, "run_teacher_fm")
+        train.main([a if a != out else out2 for a in common]
+                   + ["--max_steps", "3", "--fm_target", "teacher", "--anchor_fraction", "0.5"])
+        with open(os.path.join(out2, "final", "student_ema", "shortcut_config.json")) as f:
+            assert json.load(f)["fm_target"] == "teacher"
+        logs2 = [json.loads(line) for line in open(os.path.join(out2, "log.jsonl"))]
+        assert logs2 and all(math.isfinite(v) for r in logs2 for v in r.values()
+                             if isinstance(v, float))
+
+        # the guidance diagnostic runs on a saved student
+        import diagnose_guidance
+        r = diagnose_guidance.main(["--model", model_dir, "--student",
+                                    os.path.join(out, "final", "student_ema"), "--data_dir", data,
+                                    "--n", "4", "--batch_size", "2", "--device", "cpu"])
+        assert r["n"] == 4 and all(math.isfinite(v) for w in r["w_eff"].values()
+                                   for v in w.values() if v is not None)
+        assert all(w["all"] is not None for w in r["w_eff"].values())
 
         # reload the student into a fresh transformer: outputs must match the EMA model
         tr = SD3Transformer2DModel.from_pretrained(os.path.join(model_dir, "transformer"))
@@ -275,6 +350,8 @@ if __name__ == "__main__":
     test_eval_helpers()
     test_zero_init_equals_teacher()
     test_grid_and_sampling()
+    test_flow_mode_cfg()
+    test_guidance_diagnostic_identity()
     test_target_formula()
     test_cfg_in_predict()
     test_ema_swap()
