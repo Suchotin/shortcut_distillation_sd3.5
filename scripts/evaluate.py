@@ -1,18 +1,11 @@
-"""Evaluate the shortcut student on the first N PartiPrompts (+ the 4 prompts from the task).
+"""Evaluate a student on the first N PartiPrompts and the 4 task prompts.
 
-Methods (same initial noise per prompt for all of them):
-  teacher   SD3.5 Medium, scheduler default grid, `--teacher_steps` (40) steps, CFG 4.5
-  naive     SD3.5 Medium with only `--naive_steps` (4) steps, CFG 4.5   (what we must beat)
-  student   shortcut model, n in `--steps` (1,2,4,8), no CFG (CFG is distilled)
-
-Metrics on PartiPrompts:
-  clip_score     100 * cos(CLIP-L/14 image, text)            prompt alignment
-  pickscore      PickScore_v1 (optional, --pickscore)         human-preference proxy
-  clip_sim_teacher  cos(CLIP image emb, teacher image emb)    fidelity to the teacher
-  sec/img, NFE per image
+Compared with the same noise per prompt: the teacher (40 steps, CFG 4.5), the teacher with only
+4 steps, and the student with 1/2/4/8 steps (guidance is distilled, one pass per step).
+Metrics: CLIP score (CLIP-L/14), PickScore, CLIP image similarity to the teacher, latency.
 
 Usage:
-  python scripts/evaluate.py --student runs/shortcut/final/student_ema --out eval/run1
+  python scripts/evaluate.py --student runs/shortcut_1024/final/student_ema --out eval/run --pickscore
 """
 
 import argparse
@@ -34,10 +27,10 @@ from shortcut_sd35.shortcut import load_student, shortcut_sample  # noqa: E402
 
 @torch.no_grad()
 def teacher_sample(transformer, sched_config, noise, pe, pp, null_pe, null_pp, steps, cfg):
-    """Exactly the StableDiffusion3Pipeline denoising loop (Euler, shift, CFG)."""
+    """The StableDiffusion3Pipeline denoising loop (Euler, shift, CFG)."""
     sched = FlowMatchEulerDiscreteScheduler.from_config(sched_config)
     kw = {}
-    if sched.config.get("use_dynamic_shifting", False):  # same as the pipeline (off for SD3.5)
+    if sched.config.get("use_dynamic_shifting", False):
         from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import calculate_shift
         c = sched.config
         kw["mu"] = calculate_shift((noise.shape[-2] // 2) * (noise.shape[-1] // 2),
@@ -121,15 +114,15 @@ class Scorer:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="stabilityai/stable-diffusion-3.5-medium")
-    ap.add_argument("--student", required=True, help="dir with lora/d_embedder/shortcut_config")
+    ap.add_argument("--student", required=True, help="directory written by save_student")
     ap.add_argument("--out", default="eval/run")
     ap.add_argument("--num_prompts", type=int, default=100)
     ap.add_argument("--steps", default="1,2,4,8")
     ap.add_argument("--teacher_steps", type=int, default=40)
     ap.add_argument("--naive_steps", type=int, default=4)
     ap.add_argument("--cfg", type=float, default=4.5)
-    ap.add_argument("--height", type=int, default=512)
-    ap.add_argument("--width", type=int, default=512)
+    ap.add_argument("--height", type=int, default=1024)
+    ap.add_argument("--width", type=int, default=1024)
     ap.add_argument("--max_sequence_length", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
@@ -167,7 +160,7 @@ def main():
         d = os.path.join(args.out, "images", name)
         os.makedirs(d, exist_ok=True)
         paths = [os.path.join(d, f"{i:03d}.png") for i in range(len(prompts))]
-        if all(os.path.exists(p) for p in paths):  # cached (e.g. teacher from a previous run)
+        if all(os.path.exists(p) for p in paths):  # reuse, e.g. the teacher of an earlier run
             print(f"{name}: cached")
             return [Image.open(p).convert("RGB") for p in paths], None
         imgs, t_total = [], 0.0
@@ -183,7 +176,7 @@ def main():
         for im, p in zip(imgs, paths):
             im.save(p)
         sec = t_total / len(prompts)
-        print(f"{name}: {sec:.3f} s/img (transformer only), NFE {nfe}")
+        print(f"{name}: {sec:.3f} s/img (denoising only), NFE {nfe}")
         return imgs, sec
 
     sc = pipe.scheduler.config
@@ -204,11 +197,9 @@ def main():
             f"student_{n}step",
             lambda x, e, p, n=n: shortcut_sample(student, x, e, p, n, scfg,
                                                  null_pe=null_pe, null_pp=null_pp), nfe)
-    del student
     pipe.transformer.to("cpu")
     torch.cuda.empty_cache()
 
-    # ---- metrics on PartiPrompts ----
     scorer = Scorer(device, pickscore=args.pickscore)
     teacher_key = f"teacher_{args.teacher_steps}step_cfg"
     scored = {k: scorer.score(v[0][:n_parti], prompts[:n_parti]) for k, v in results.items()}
@@ -233,7 +224,6 @@ def main():
         f.write(f"PartiPrompts first {n_parti}, {args.height}x{args.width}\n\n{table}\n")
     print(table)
 
-    # ---- grids: the 4 task prompts, and the first 8 PartiPrompts ----
     names = list(results)
     for tag, idx in (("showcase", range(n_parti, len(prompts))), ("parti", range(min(8, n_parti)))):
         rows = [[results[k][0][i] for k in names] for i in idx]

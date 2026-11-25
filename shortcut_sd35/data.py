@@ -15,7 +15,6 @@ import glob
 import json
 import os
 
-import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 from torch.utils.data import Dataset

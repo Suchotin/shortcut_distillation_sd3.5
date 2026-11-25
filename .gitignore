@@ -1,7 +1,7 @@
-# The original task statement (PDF) is not redistributed; it is quoted in README.md instead.
+# The task statement (PDF) is not redistributed.
 *.pdf
 
-# Run outputs (large; produced by run_all.sh)
+# Run outputs
 data/sd35m_*/
 runs/
 eval/
@@ -18,3 +18,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Images written by scripts/sample.py
+samples/

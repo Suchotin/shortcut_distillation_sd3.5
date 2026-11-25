@@ -20,7 +20,7 @@ from shortcut_sd35.data import SHOWCASE_PROMPTS, LatentDataset  # noqa: E402
 from shortcut_sd35.shortcut import (EMA, ShortcutConfig, ShortcutSD3, add_lora,  # noqa: E402
                                     load_student, predict, sample_bootstrap,
                                     sample_flow_matching, sampling_sigmas,
-                                    self_consistency_target, shift_sigma, shortcut_sample,
+                                    self_consistency_target, shortcut_sample,
                                     teacher_mode)
 
 L, JD, PD, C, H = 12, 32, 64, 16, 8  # text tokens, text dim, pooled dim, latent ch, latent hw
@@ -153,8 +153,8 @@ def test_guidance_diagnostic_identity():
                                          batch_size=4)
     assert abs(r["w_eff"]["d=0"]["all"] - 1) < 1e-4 and abs(r["w_eff"]["d=0.25"]["all"] - 1) < 1e-4
     assert abs(r["level1_loss_student"] - r["level1_loss_cond_teacher"]) < 1e-6
-    assert math.isfinite(r["w_eff"]["level-1 target"]["all"])
-    print(diagnose_guidance.to_markdown(r, "identity student").splitlines()[-1])
+    assert math.isfinite(r["w_eff"]["target"]["all"])
+    print(diagnose_guidance.to_markdown(r).splitlines()[-1])
     print("ok guidance diagnostic (student = teacher -> w_eff = 1)")
 
 
@@ -172,7 +172,7 @@ def test_target_formula():
     b = sample_bootstrap(16, cfg, generator=g)
     x = torch.randn(16, C, H, H)
     pe, pp = rand_cond(16)
-    tgt = self_consistency_target(m, x, b, pe, pp, pe[:1], pp[:1], cfg)
+    tgt = self_consistency_target(m, x, b, pe, pp, pe[:1], pp[:1], cfg, base_from_teacher=False)
     # manual two Euler half-steps, then average velocity over the full step
     d1 = (b["sigma0"] - b["sigma1"]).view(-1, 1, 1, 1)
     d2 = (b["sigma1"] - b["sigma2"]).view(-1, 1, 1, 1)
@@ -185,7 +185,7 @@ def test_target_formula():
     # uniform grid (shift = 1) -> plain average as in the paper
     cfg1 = ShortcutConfig(base_steps=8, shift=1.0, cfg_scale=1.0)
     b1 = sample_bootstrap(16, cfg1, generator=g)
-    t1 = self_consistency_target(m, x, b1, pe, pp, pe[:1], pp[:1], cfg1)
+    t1 = self_consistency_target(m, x, b1, pe, pp, pe[:1], pp[:1], cfg1, base_from_teacher=False)
     v1 = m(x, b1["sigma0"], None, None, None)
     v2 = m(x - (b1["sigma0"] - b1["sigma1"]).view(-1, 1, 1, 1) * v1, b1["sigma1"], None, None, None)
     assert torch.allclose(t1, (v1 + v2) / 2, atol=1e-5)
@@ -257,11 +257,11 @@ def test_train_end_to_end(mixed_precision):
         out = os.path.join(tmp, "run")
         common = ["--model", model_dir, "--data_dir", data, "--output_dir", out,
                   "--base_steps", "8", "--lora_rank", "4", "--lora_alpha", "4",
-                  "--batch_size", "4", "--bootstrap_fraction", "0.5", "--num_workers", "0",
+                  "--batch_size", "4", "--grad_accum", "1", "--num_workers", "0",
                   "--log_every", "2", "--val_every", "3", "--save_every", "3",
                   "--val_steps", "1,2,4,8", "--mixed_precision", mixed_precision,
                   "--gradient_checkpointing", "--lr", "1e-3", "--warmup_steps", "0"]
-        train.main(common + ["--max_steps", "6", "--base_velocity", "teacher"])
+        train.main(common + ["--max_steps", "6"])
         assert os.path.exists(os.path.join(out, "final", "student_ema", "lora.safetensors"))
         # the last checkpoint is the final state: linked, not copied
         assert os.path.islink(os.path.join(out, "final"))
@@ -280,12 +280,14 @@ def test_train_end_to_end(mixed_precision):
         assert st["step"] == 8
         assert os.path.exists(os.path.join(out, "checkpoint-6", "student_ema", "lora.safetensors"))
 
-        # teacher-target flow matching + anchored level 1
-        out2 = os.path.join(tmp, "run_teacher_fm")
-        train.main([a if a != out else out2 for a in common]
-                   + ["--max_steps", "3", "--fm_target", "teacher", "--anchor_fraction", "0.5"])
-        with open(os.path.join(out2, "final", "student_ema", "shortcut_config.json")) as f:
+        with open(os.path.join(out, "final", "student_ema", "shortcut_config.json")) as f:
             assert json.load(f)["fm_target"] == "teacher"
+
+        # the paper's variant: data target at d = 0, levels round-robin, EMA base case
+        out2 = os.path.join(tmp, "run_paper")
+        train.main([a if a != out else out2 for a in common]
+                   + ["--max_steps", "3", "--fm_target", "data", "--anchor_fraction", "0",
+                      "--base_velocity", "ema"])
         logs2 = [json.loads(line) for line in open(os.path.join(out2, "log.jsonl"))]
         assert logs2 and all(math.isfinite(v) for r in logs2 for v in r.values()
                              if isinstance(v, float))

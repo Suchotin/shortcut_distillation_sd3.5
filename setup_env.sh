@@ -1,89 +1,57 @@
 #!/usr/bin/env bash
-# Environment setup for a single-GPU Linux box (tested on a Hopper GPU, sm_90).
+# Environment for a single-GPU Linux machine.
 #
-#   bash setup_env.sh install    # no GPU needed: Python 3.12 venv + torch + pinned deps
-#   bash setup_env.sh download   # no GPU needed: SD3.5 Medium + metric models + PartiPrompts
-#   bash setup_env.sh check      # GPU: driver / CUDA / torch / bf16 / attention kernels
-#   bash setup_env.sh bench      # GPU, ~5 min: 64 teacher images + 30 train steps -> ETA, memory
+#   bash setup_env.sh install    # Python 3.12 venv, torch for the host driver, pinned packages
+#   bash setup_env.sh download   # SD3.5 Medium, metric models, PartiPrompts (needs `hf auth login`)
+#   bash setup_env.sh check      # GPU, CUDA, bf16, attention kernels
 #
-# Afterwards, in every new shell:  source $ROOT/shortcut_env.sh
+# Then, in every new shell: source $ROOT/shortcut_env.sh
 #
-# Configuration (environment variables):
-#   ROOT            working directory for venv, HF cache, data and runs (default: ~/shortcut_work);
-#                   put it on a disk with >= 60 GB free
-#   TORCH_CU        torch CUDA build: auto (from the driver) | cu132 | cu134 | cu130 | cu126
-#   NETWORK_SETUP   optional shell file sourced before downloads (e.g. proxy settings)
-#   HF_ENDPOINT     optional Hugging Face endpoint override (standard huggingface_hub variable)
-#
-# Stack: Python 3.12, torch 2.15.0+cu132 (bundles CUDA 13.2 runtime, cuDNN, NCCL) and the pinned
-# packages from requirements.txt. No CUDA toolkit / nvcc is needed (no custom kernels; attention
-# runs through PyTorch SDPA). Only the host *driver* matters: torch cu132 needs a driver that
-# supports CUDA >= 13.2. On older drivers (CUDA 12.x) use torch 2.14.1+cu126:
-# TORCH_CU=cu126 bash setup_env.sh install  (auto-detected when a GPU is visible).
+#   ROOT      working directory for the venv, model cache, data and runs (~70 GB, default ~/shortcut_work)
+#   TORCH_CU  torch CUDA build: auto (from the driver) | cu132 | cu130 | cu126
 set -euo pipefail
-
 ROOT=${ROOT:-$HOME/shortcut_work}
 VENV=${VENV:-$ROOT/venv}
 ENV_FILE=$ROOT/shortcut_env.sh
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TORCH_CU=${TORCH_CU:-auto}
-PRICE_PER_HOUR=${PRICE_PER_HOUR:-1.50}  # USD per GPU-hour, only used for the bench cost estimate
-# some cloud images keep conda in /root/miniconda3 but add it to PATH only for interactive shells
-if [ -d /root/miniconda3/bin ]; then export PATH="/root/miniconda3/bin:$PATH"; fi
-
 log() { echo -e "\033[1;32m[setup]\033[0m $*" >&2; }
 die() { echo -e "\033[1;31m[setup] $*\033[0m" >&2; exit 1; }
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
-network() {  # optional site-specific network configuration (proxies etc.)
-  if [ -n "${NETWORK_SETUP:-}" ]; then
-    [ -f "$NETWORK_SETUP" ] || die "NETWORK_SETUP=$NETWORK_SETUP does not exist"
-    set +u; source "$NETWORK_SETUP" >/dev/null 2>&1 || true; set -u
-    log "sourced NETWORK_SETUP=$NETWORK_SETUP"
-  fi
-}
-
-driver_cuda() {  # max CUDA version supported by the host driver, empty without a GPU
-  { nvidia-smi 2>/dev/null || true; } | grep -oE 'CUDA Version: [0-9]+\.[0-9]+' | grep -oE '[0-9.]+$' | head -n1 || true
-}
-
 pick_torch() {
   if [ "$TORCH_CU" = auto ]; then
-    local drv; drv=$(driver_cuda)
-    if [ -z "$drv" ]; then
-      log "no GPU visible: assuming the driver supports CUDA >= 13.2 -> cu132 (else set TORCH_CU=cu126)"
-      TORCH_CU=cu132
-    elif ver_ge "$drv" 13.2; then TORCH_CU=cu132
+    local drv
+    drv=$({ nvidia-smi 2>/dev/null || true; } | grep -oE 'CUDA Version: [0-9.]+' | grep -oE '[0-9.]+$' | head -n1)
+    if [ -z "$drv" ] || ver_ge "$drv" 13.2; then TORCH_CU=cu132
     elif ver_ge "$drv" 13.0; then TORCH_CU=cu130
     elif ver_ge "$drv" 12.0; then TORCH_CU=cu126
-    else die "driver supports only CUDA $drv; a driver with CUDA >= 12.0 (ideally >= 13.2) is required"
+    else die "the driver supports only CUDA $drv, at least 12.0 is needed"
     fi
-    [ -n "$drv" ] && log "driver supports CUDA $drv -> torch build $TORCH_CU"
+    log "driver CUDA ${drv:-unknown} -> torch build $TORCH_CU"
   fi
   case $TORCH_CU in
-    cu132|cu134) TORCH_VER=2.15.0 ;;
+    cu132) TORCH_VER=2.15.0 ;;
     cu130|cu126) TORCH_VER=2.14.1 ;;
-    *) die "unsupported TORCH_CU=$TORCH_CU (use cu132, cu134, cu130 or cu126)" ;;
+    *) die "unsupported TORCH_CU=$TORCH_CU" ;;
   esac
 }
 
-find_python() {  # prints a Python >= 3.12 interpreter (numpy 2.5 / diffusers 0.43 requirement)
+find_python() {
   local c
   for c in python3.12 python3.13 python3; do
-    # ensurepip is required by `python -m venv` (missing in Ubuntu's system Python without python3-venv)
     if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys, venv, ensurepip; sys.exit(sys.version_info < (3, 12))' 2>/dev/null; then
       command -v "$c"; return
     fi
   done
   if command -v conda >/dev/null 2>&1; then
-    log "no Python >= 3.12 on PATH, creating one with conda (conda-forge) in $ROOT/py312"
-    conda create -y -q -p "$ROOT/py312" --override-channels -c conda-forge python=3.12 >&2
+    conda create -y -q -p "$ROOT/py312" -c conda-forge python=3.12 >&2
     echo "$ROOT/py312/bin/python"; return
   fi
-  die "need Python >= 3.12 (with venv/ensurepip) or conda"
+  die "Python >= 3.12 with venv (or conda) is required"
 }
 
-cpu_limit() {  # CPUs granted to the container (cgroup quota), not the host's core count
+cpu_limit() {  # CPUs of the container quota, not of the host
   local q p
   if [ -r /sys/fs/cgroup/cpu.max ]; then
     read -r q p < /sys/fs/cgroup/cpu.max
@@ -92,60 +60,38 @@ cpu_limit() {  # CPUs granted to the container (cgroup quota), not the host's co
   nproc
 }
 
-write_env() {
-  local cpus; cpus=$(cpu_limit)
-  cat > "$ENV_FILE" <<EOF
-# generated by setup_env.sh — source this in every new shell
-source "$VENV/bin/activate"
-export ROOT="$ROOT"
-export OMP_NUM_THREADS=$cpus MKL_NUM_THREADS=$cpus   # container CPU quota (host may show more cores)
-export HF_HOME="$ROOT/hf"
-export PIP_NO_CACHE_DIR=1   # wheels are ~4 GB; keep the disk for models and data
-export TOKENIZERS_PARALLELISM=false
-export PYTHONUNBUFFERED=1
-EOF
-}
-
 cmd_install() {
   mkdir -p "$ROOT"
   pick_torch
   local py; py=$(find_python)
-  log "python: $py ($("$py" -V 2>&1))"
   [ -x "$VENV/bin/python" ] || "$py" -m venv "$VENV"
-  write_env
+  local cpus; cpus=$(cpu_limit)
+  cat > "$ENV_FILE" <<EOF
+source "$VENV/bin/activate"
+export ROOT="$ROOT" HF_HOME="$ROOT/hf"
+export OMP_NUM_THREADS=$cpus MKL_NUM_THREADS=$cpus TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
+EOF
   # shellcheck disable=SC1090
   source "$ENV_FILE"
-  network
   python -m pip install -q -U pip
-  log "installing torch==$TORCH_VER from https://download.pytorch.org/whl/$TORCH_CU"
-  pip install "torch==$TORCH_VER" --index-url "https://download.pytorch.org/whl/$TORCH_CU"
-  log "installing pinned packages (requirements.txt)"
-  pip install -r "$REPO/requirements.txt"
-  python - <<'EOF'
-import torch, diffusers, transformers, peft, accelerate
-print(f"torch {torch.__version__} (CUDA runtime {torch.version.cuda}) | diffusers {diffusers.__version__} | "
-      f"transformers {transformers.__version__} | peft {peft.__version__} | accelerate {accelerate.__version__}")
-EOF
-  log "done. In new shells run: source $ENV_FILE"
+  pip install --no-cache-dir "torch==$TORCH_VER" --index-url "https://download.pytorch.org/whl/$TORCH_CU"
+  pip install --no-cache-dir -r "$REPO/requirements.txt"
+  python -c "import torch, diffusers; print('torch', torch.__version__, '| diffusers', diffusers.__version__)"
+  log "done. In new shells: source $ENV_FILE"
 }
 
 cmd_download() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
-  network
-  if [ -z "${HF_ENDPOINT:-}" ]; then
-    hf auth whoami >/dev/null 2>&1 || die "not logged in to Hugging Face: run 'hf auth login' with a token of an account that accepted the SD3.5 Medium license (or export HF_TOKEN=...)"
-  fi
-  log "SD3.5 Medium: diffusers folders only (~17 GB; root single-file/ComfyUI files are skipped)"
+  hf auth whoami >/dev/null 2>&1 || die "run 'hf auth login' with an account that accepted the SD3.5 Medium license"
   hf download stabilityai/stable-diffusion-3.5-medium --include model_index.json \
     --include "scheduler/*" --include "transformer/*" --include "vae/*" \
-    --include "text_encoder/*" --include "text_encoder_2/*" --include "text_encoder_3/*" \
-    --include "tokenizer/*" --include "tokenizer_2/*" --include "tokenizer_3/*"
-  log "metric models: CLIP-L/14 (CLIP score), PickScore_v1 + CLIP-H processor (configs only)"
-  hf download openai/clip-vit-large-patch14 --include "*.json" --include "*.txt" --include model.safetensors
-  hf download yuvalkirstain/PickScore_v1 --include "*.json" --include "*.txt" --include model.safetensors
+    --include "text_encoder*/*" --include "tokenizer*/*"
+  for repo in openai/clip-vit-large-patch14 yuvalkirstain/PickScore_v1; do
+    hf download "$repo" --include "*.json" --include "*.txt" --include model.safetensors
+  done
   hf download laion/CLIP-ViT-H-14-laion2B-s32B-b79K --include "*.json" --include "*.txt"
-  python -c "from datasets import load_dataset; print(len(load_dataset('nateraw/parti-prompts', split='train')), 'PartiPrompts cached')"
+  python -c "from datasets import load_dataset; print(len(load_dataset('nateraw/parti-prompts', split='train')), 'PartiPrompts')"
   du -sh "$HF_HOME" >&2
 }
 
@@ -155,30 +101,9 @@ cmd_check() {
   python "$REPO/scripts/check_env.py"
 }
 
-cmd_bench() {
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  local B=$ROOT/bench; rm -rf "$B"; mkdir -p "$B"
-  export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1  # everything is pre-downloaded
-  # shellcheck disable=SC1091
-  source "$REPO/scripts/gpu_defaults.sh"
-  cd "$REPO"
-  log "bench 1/2: teacher generation, 64 images, batch $GEN_BS"
-  python scripts/generate_data.py --prompts data/prompts.txt --out "$B/data" --limit 64 \
-    --batch_size "$GEN_BS" --shard_size 64 --num_previews 4 2>&1 | tee "$B/gen.log"
-  log "bench 2/2: 30 training steps ($GC_FLAG)"
-  python scripts/train.py --data_dir "$B/data" --output_dir "$B/run" --max_steps 30 \
-    --log_every 10 --val_every 1000000 --save_every 1000000 $GC_FLAG 2>&1 | tee "$B/train.log"
-  python scripts/bench_report.py "$B/gen.log" "$B/run/log.jsonl" \
-    --images "$(wc -l < data/prompts.txt)" --steps 6000 --price "$PRICE_PER_HOUR"
-  rm -rf "$B/run/final" "$B"/data/shard_*  # free ~3 GB; previews and sample grids are kept
-  log "bench previews: $B/data/previews, step-0 sample grid: $B/run/samples"
-}
-
 case "${1:-}" in
   install) cmd_install ;;
   download) cmd_download ;;
   check) cmd_check ;;
-  bench) cmd_bench ;;
-  *) sed -n '2,8p' "$0"; exit 1 ;;
+  *) sed -n '2,11p' "$0"; exit 1 ;;
 esac

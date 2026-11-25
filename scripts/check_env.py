@@ -1,9 +1,5 @@
-"""GPU / CUDA / PyTorch sanity check for the training box (run with the GPU attached).
-
-Checks: driver + CUDA runtime of the torch build, compute capability (Hopper = sm_90), bf16,
-that the build ships kernels for this GPU, bf16 matmul throughput, and which fused attention
-kernels (flash / cuDNN / mem-efficient) SDPA can use at SD3.5 shapes.
-"""
+"""GPU sanity check: driver and CUDA runtime, bf16, kernels for this GPU, matmul throughput and
+the fused attention kernels available at SD3.5 shapes."""
 
 import subprocess
 import sys
@@ -37,7 +33,6 @@ def main():
         print("FAIL: bf16 not supported")
         ok = False
 
-    # bf16 matmul throughput (Hopper-class GPUs: expect several hundred TFLOPS)
     n = 8192
     a = torch.randn(n, n, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(n, n, device="cuda", dtype=torch.bfloat16)
@@ -51,7 +46,7 @@ def main():
     tflops = 2 * n**3 * it / (time.time() - t0) / 1e12
     print(f"bf16 matmul {n}x{n}: {tflops:.0f} TFLOPS")
 
-    # SDPA kernels at SD3.5 Medium shapes (24 heads x 64, 512^2 image + 333 text tokens)
+    # 24 heads x 64, a 512^2 image + 333 text tokens
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     q = torch.randn(8, 24, 1357, 64, device="cuda", dtype=torch.bfloat16)

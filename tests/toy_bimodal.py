@@ -1,10 +1,8 @@
-"""Toy check (CPU, ~3 min) that the training objective really learns shortcuts.
+"""Toy check (CPU, ~3 min) that the objective learns shortcuts.
 
-1. Pretrain a tiny SD3-architecture flow-matching "teacher" on bimodal data
-   (every latent is all +1 or all -1, plus small noise). For such data, naive 1-step Euler
-   collapses to the mean (paper Fig. 2).
-2. Distill it with scripts/train.py (LoRA + zero-init d-embedder, shortcut objective).
-3. Compare few-step samples with the teacher's 32-step ODE solution from the same noise.
+A tiny SD3-architecture teacher is trained on bimodal data (all latents +1 or -1), where naive
+1-step Euler collapses to the mean (paper Fig. 2). It is then distilled with scripts/train.py
+and the few-step samples are compared with the teacher's 32-step ODE solution.
 
 Run:  python tests/toy_bimodal.py [--base_velocity teacher|ema]
 """
@@ -57,10 +55,10 @@ def main():
     save_file({"prompt_embeds": npe.half(), "pooled": npp.half()},
               os.path.join(data, "null_embeds.safetensors"))
 
-    # 1) teacher: plain flow matching, full fine-tune, logit-normal sigma, 10% prompt dropout
+    # teacher: plain flow matching, logit-normal sigma, 10% prompt dropout
     tr = T.tiny_transformer()
     opt = torch.optim.AdamW(tr.parameters(), lr=1e-3)
-    for it in range(args.pretrain_steps):
+    for _ in range(args.pretrain_steps):
         x1 = bimodal(64, g)
         eps = torch.randn_like(x1)
         s = torch.sigmoid(torch.randn(64))
@@ -80,7 +78,7 @@ def main():
     X = torch.randn(256, T.C, T.H, T.H, generator=torch.Generator().manual_seed(5))
     PE, PP = pe1.expand(256, -1, -1), pp1.expand(256, -1)
 
-    def on_mode(x):  # fraction of samples that landed on one of the two modes
+    def on_mode(x):  # share of samples on one of the two modes
         return ((x.mean(dim=(1, 2, 3)).abs() - 1).abs() < 0.25).float().mean().item()
 
     def report(st, cfg, ref):
@@ -92,7 +90,7 @@ def main():
                                   "frac_on_mode": round(on_mode(xs), 3)}
         return r
 
-    # teacher = zero LoRA + zero-init d-embedder (d has no effect -> naive Euler of the teacher)
+    # zero LoRA and zero d-embedding: the teacher itself, sampled with naive Euler
     c0 = ShortcutConfig(base_steps=8, shift=3.0, cfg_scale=1.0, lora_rank=16, lora_alpha=16)
     t0 = mk()
     add_lora(t0, c0)
@@ -105,11 +103,11 @@ def main():
         ref = shortcut_sample(teacher, X, PE, PP, 32, c0, null_pe=npe, null_pp=npp)
     before = report(teacher, c0, ref)
 
-    # 2) shortcut distillation with the real training script
     out = os.path.join(tmp, "run")
     train.main(["--model", model_dir, "--data_dir", data, "--output_dir", out,
                 "--base_steps", "8", "--lora_rank", "16", "--lora_alpha", "16",
-                "--batch_size", "16", "--bootstrap_fraction", "0.5", "--num_workers", "0",
+                "--batch_size", "16", "--grad_accum", "1", "--bootstrap_fraction", "0.5",
+                "--anchor_fraction", "0", "--fm_target", "data", "--num_workers", "0",
                 "--log_every", "200", "--val_every", "100000", "--save_every", "100000",
                 "--lr", args.lr, "--warmup_steps", "0", "--ema_decay", "0.99",
                 "--cfg_scale", "1.0", "--weight_decay", "0.0", "--mixed_precision", "no",
